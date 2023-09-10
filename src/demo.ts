@@ -25,7 +25,6 @@ async function main() {
     setTimeout(async () => {
       await clent.close();
     }, 30 * 1000);
-    
   } catch (err) {
     console.error("Error:", err);
   }
