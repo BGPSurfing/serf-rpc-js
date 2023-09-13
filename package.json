@@ -1,6 +1,6 @@
 {
   "name": "serf-rpc-js",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Hashicorp Serf RPC Client",
   "private": false,
   "license": "GPL-3.0",
