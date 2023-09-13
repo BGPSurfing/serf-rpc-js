@@ -1,5 +1,8 @@
 import * as net from "node:net";
 import * as msgpack from "msgpack-lite";
+import { EventEmitter } from "node:events";
+
+const NOOP: number = 0;
 
 export enum SerfCmd {
   handshake = "handshake",
@@ -24,107 +27,140 @@ export enum SerfCmd {
   get_coordinate = "get-coordinate",
 }
 
-interface SerfOpt {
-  request: boolean;
-  response: boolean;
+export enum SerfErr {
+  Invalid, // todo
 }
 
-const SerfCommands: { [Cmd in SerfCmd]: SerfOpt } = {
+interface CmdBase {
+  Seq: number;
+}
+
+interface CmdHead extends CmdBase {
+  Command: string;
+}
+
+interface CmdResp extends CmdBase {
+  Error: string;
+}
+
+interface CmdOpt {
+  stream: boolean; // expected data after subbed
+  request: boolean; // requires body after header
+  response: boolean; // responds data after header
+}
+
+interface CmdState {
+  stream: boolean; // for event
+  response: boolean; // for command
+
+  reject: Function;
+  resolve: Function;
+}
+
+const CmdList: { [Cmd in SerfCmd]: CmdOpt } = {
   [SerfCmd.handshake]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.auth]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.event]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.force_leave]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.join]: {
+    stream: false,
     request: true,
     response: true,
   },
   [SerfCmd.members]: {
+    stream: false,
     request: false,
     response: true,
   },
   [SerfCmd.members_filtered]: {
+    stream: false,
     request: true,
     response: true,
   },
   [SerfCmd.tags]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.stream]: {
-    // No Support
+    stream: true,
     request: false,
     response: false,
   },
   [SerfCmd.monitor]: {
-    // No Support
+    stream: true,
     request: true,
     response: false,
   },
   [SerfCmd.stop]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.leave]: {
+    stream: false,
     request: false,
     response: false,
   },
   [SerfCmd.query]: {
-    // No Support
+    stream: true,
     request: true,
     response: true,
   },
   [SerfCmd.respond]: {
+    stream: false,
     request: true,
     response: false,
   },
   [SerfCmd.install_key]: {
+    stream: false,
     request: true,
     response: true,
   },
   [SerfCmd.use_key]: {
+    stream: false,
     request: true,
     response: true,
   },
   [SerfCmd.remove_key]: {
+    stream: false,
     request: true,
     response: true,
   },
   [SerfCmd.list_keys]: {
+    stream: false,
     request: false,
     response: true,
   },
   [SerfCmd.stats]: {
+    stream: false,
     request: false,
     response: true,
   },
   [SerfCmd.get_coordinate]: {
+    stream: false,
     request: true,
     response: true,
   },
 };
 
-interface Callback {
-  reject: Function;
-  resolve: Function;
-}
-
-interface CallbackEx extends Callback {
-  response: boolean;
-}
-
-export class SerfClient {
+export class SerfClient extends EventEmitter {
   private host: string;
   private port: number;
 
@@ -136,15 +172,16 @@ export class SerfClient {
   private socket: net.Socket;
   private stream: msgpack.DecodeStream;
 
-  private handlers: { [key: string]: Callback } = {};
-  private requests: { [key: number]: CallbackEx } = {};
+  private handlers: { [seq: number]: CmdState } = {};
 
   constructor(host: string, port: number) {
+    super();
+
     this.host = host;
     this.port = port;
 
-    this.seq = 1;
-    this.next = 0;
+    this.seq = NOOP;
+    this.next = NOOP;
 
     this.alive = false;
 
@@ -157,129 +194,159 @@ export class SerfClient {
     this.socket.pipe(this.stream);
   }
 
+  private getHandler(seq: number): CmdState | null {
+    return seq in this.handlers ? this.handlers[seq] : null;
+  }
+  private remHandler(seq: number): void {
+    delete this.handlers[seq];
+  }
+
   private handle(data: any): void {
     if (this.alive) {
-      if (this.next) {
-        this.handleEnd(data);
-      } else if ("Seq" in data) {
-        this.handleSeq(data);
-      } else if ("event" in data) {
-        this.handleEvt(data);
-      }
-    }
-  }
-
-  private handleEvt(data: any) {
-    const event = data["event"];
-
-    if (this.handlers[event]) {
-      const cb = this.handlers[event];
-      cb.resolve(data);
-    } else {
-      console.warn(`Unhandled event type: ${event}`);
-    }
-  }
-
-  private handleSeq(data: any) {
-    const seq = data["Seq"];
-    const error = data["Error"];
-
-    if (this.requests[seq]) {
-      const cb = this.requests[seq];
-
-      if (error.length) {
-        cb.reject(new Error(error));
-      }
-
-      if (cb.response) {
-        this.next = seq;
+      if ("Seq" in data) {
+        this.handleResp(data);
       } else {
-        delete this.requests[seq];
-        cb.resolve(seq);
+        this.handleBody(data);
       }
-    } else if (error.length) {
-      console.warn(`Unhandled Seq err: ${error}`);
-    } else {
-      console.warn(`Unhandled Seq num: ${seq}`);
     }
   }
 
-  private handleEnd(data: any) {
+  private handleResp(resp: CmdResp): void {
+    const seq = resp.Seq;
+    const state = this.getHandler(seq);
+
+    if (state === null) {
+      this.emit("error", SerfErr.Invalid, seq);
+      return;
+    }
+
+    const error = resp.Error;
+
+    if (error.length) {
+      this.remHandler(seq);
+      state.reject(new Error(error));
+    } else if (state.response) {
+      this.next = seq;
+      if (state.stream) {
+        state.response = false;
+        state.resolve(seq);
+      }
+    } else if (state.stream) {
+      this.next = seq;
+    } else {
+      this.remHandler(seq);
+      state.resolve(seq);
+    }
+  }
+  private handleBody(data: any) {
     const seq = this.next;
+    const state = this.getHandler(seq);
 
-    if (this.requests[seq]) {
-      const cb = this.requests[seq];
+    this.next = NOOP;
 
-      delete this.requests[seq];
+    if (state === null) {
+      this.emit("error", seq, SerfErr.Invalid);
+      return;
+    }
 
-      this.next = 0;
+    if (state.stream) {
+      this.emit("stream", seq, data);
+      return;
+    }
 
-      if (cb.response) {
-        cb.resolve(data);
-      } else {
-        cb.reject("Invalid Seqeuence");
-      }
+    this.remHandler(seq);
+
+    if (state.response) {
+      state.resolve(data);
     } else {
-      console.warn(`Unhandled Seq num: ${seq}`);
-      console.warn(`Unhandled Seq body: ${data}`);
+      state.reject(new Error("Invalid Responsee"));
     }
   }
 
-  public event(eventType: string, handler: Function): SerfClient {
-    this.handlers[eventType] = {
-      reject: (err: any) => handler(err),
-      resolve: (data: any) => handler(data),
-    };
+  private write(head: CmdHead, body: any = null) {
+    const headData = msgpack.encode(head);
+    this.socket.write(headData);
 
-    return this;
+    if (body) {
+      const bodyData = msgpack.encode(body);
+      this.socket.write(bodyData);
+    }
   }
 
-  public async open(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.socket.once("error", (err) => reject(err));
-
-      this.socket.connect(this.port, this.host, () => {
-        this.alive = true;
-        resolve();
-      });
-    });
-  }
-
-  public async send(cmd: SerfCmd, body: any = null): Promise<any> {
+  public async request(cmd: SerfCmd, body: any = null): Promise<any> {
     return new Promise<any>((resolve, reject) => {
       if (!this.alive) {
         reject(new Error("Client is not alive"));
       }
 
-      const Seq = this.seq++;
+      const seq = ++this.seq;
 
-      const { request, response } = SerfCommands[cmd];
+      const { stream, request, response } = CmdList[cmd];
 
-      if (request && !body) {
-        reject(`${cmd} requires a body`);
+      if (request && body === null) {
+        reject(`${cmd} requires a request body`);
       }
 
-      this.requests[Seq] = {
+      this.handlers[seq] = {
+        stream: stream,
+        response: response,
+
         reject: (err: any) => reject(err),
         resolve: (data: any) => resolve(data),
-        response: response,
       };
 
-      this.socket.once("error", (err) => {
-        delete this.requests[Seq];
-        reject(err);
+      let handled = false;
+
+      this.socket.prependOnceListener("error", (err) => {
+        if (handled === false) {
+          this.remHandler(seq);
+          reject(err);
+        }
       });
 
-      const header = msgpack.encode({ Command: cmd, Seq });
-      this.socket.write(header);
+      this.write({ Seq: seq, Command: cmd }, body);
 
-      if (body) {
-        const payload = msgpack.encode(body);
-        this.socket.write(payload);
+      handled = true;
+
+      if (stream && response === false) {
+        resolve(seq);
       }
     });
   }
 
+  public async handshake(): Promise<any> {
+    return this.request(SerfCmd.handshake, { Version: 1 });
+  }
+
+  public async open(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let complete = false;
+
+      this.socket.once("error", (error: Error) => {
+        if (complete) {
+          return;
+        }
+
+        complete = true;
+        this.alive = false;
+
+        reject(error);
+      });
+
+      this.socket.connect(this.port, this.host, () => {
+        if (complete) {
+          return;
+        }
+
+        this.removeAllListeners("error");
+
+        complete = true;
+        this.alive = true;
+
+        resolve();
+      });
+    });
+  }
   public async close(): Promise<void> {
     return new Promise<void>((resolve) =>
       this.socket.end(() => {

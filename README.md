@@ -2,19 +2,14 @@
 
 Hashicorp's Serf RPC Client in NodeJS
 
-### Future Plans
-
-- Complete event handling for inner socket
-- Complete stream commands
-
-### Bad Commands
-
-- `stream`
-- `monitor`
-- `query`
+### Remaning
+- Express socket state / health better by emit event
+- Add method to remove event subscribe
 
 ---
 
 #### Note
 
-This is first time using typescript. Please let me know if better practice. Thank :laughing:
+This is progress in work!
+This is first time using typescript. 
+Please let me know if better practice. Thank :laughing:
